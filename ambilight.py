@@ -12,6 +12,8 @@ import numpy as np
 import pywinusb.hid as hid
 
 import mss
+import pystray
+from PIL import Image, ImageDraw
 
 # === Hardware ===
 VID, PID = 0x1A86, 0xFE07
@@ -457,6 +459,7 @@ class AmbilightGUI:
         self._build_ui()
         self._apply_config()
         self._update_loop()
+        self.tray_icon = None
 
         # Auto-Start beim Öffnen
         if self.cfg.get("autostart_mode", False):
@@ -818,8 +821,47 @@ class AmbilightGUI:
                                fill=f"#{r:02x}{g:02x}{b:02x}", outline="")
 
     def run(self):
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
         self.root.mainloop()
+
+    # ---- System Tray ----
+
+    def _create_tray_icon_image(self):
+        """Erstellt ein kleines farbiges Icon für den Tray."""
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Farbiger Kreis mit Accent-Farbe
+        draw.ellipse([4, 4, 60, 60], fill=(88, 166, 255, 255),
+                     outline=(255, 255, 255, 200), width=2)
+        draw.text((20, 18), "DX", fill=(255, 255, 255, 255))
+        return img
+
+    def _minimize_to_tray(self):
+        """Fenster verstecken und ins System-Tray minimieren."""
+        self.root.withdraw()
+        if self.tray_icon is None:
+            menu = pystray.Menu(
+                pystray.MenuItem("Öffnen", self._tray_restore, default=True),
+                pystray.MenuItem("Beenden", self._tray_quit)
+            )
+            self.tray_icon = pystray.Icon(
+                "DX-Light", self._create_tray_icon_image(),
+                "DX-Light Ambilight", menu
+            )
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        else:
+            self.tray_icon.visible = True
+
+    def _tray_restore(self, icon=None, item=None):
+        """Fenster aus dem Tray wiederherstellen."""
+        self.root.after(0, self.root.deiconify)
+
+    def _tray_quit(self, icon=None, item=None):
+        """Programm komplett beenden."""
+        if self.tray_icon:
+            self.tray_icon.stop()
+            self.tray_icon = None
+        self.root.after(0, self._on_close)
 
     def _on_close(self):
         # Einstellungen speichern

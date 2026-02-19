@@ -1,4 +1,7 @@
 mss
 numpy
 pywinusb
+pystray
+Pillow
+openrgb-python
 pyinstaller
