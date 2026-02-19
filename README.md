@@ -10,7 +10,7 @@ Ein performantes Ambilight-Tool für den **DX-Light LED-Strip** (Robobloq USB HI
   - **🎬 Film**: Sanft & atmosphärisch (hohes Smoothing, breiter Rand).
   - **Statisch**: Wähle eine feste Farbe über den Color-Picker.
   - **Effekte**: Rainbow, Breathing, Color Cycle.
-- 📺 **Aspekt-Ratio Support**: Automatischer Crop für 21:9, 16:9, Kino-Formate usw.
+- 📺 **Aspekt-Ratio Support**: Automatischer Crop für 21:9, 16:9, Kino-Formate sowie ein **manueller Crop-Modus** (H-Crop/V-Crop Slider) mit Live-Vorschau.
 - ⚙️ **System-Integration**:
   - **Autostart**: Startet optional mit Windows.
   - **Persistenz**: Speichert alle Einstellungen in einer JSON-Datei.

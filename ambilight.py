@@ -13,7 +13,7 @@ import pywinusb.hid as hid
 
 import mss
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 
 # === Hardware ===
 VID, PID = 0x1A86, 0xFE07
@@ -30,6 +30,7 @@ ASPECT_RATIOS = {
     "2.35:1 (Kino)": (2.35, 1),
     "2.39:1 (Kino)": (2.39, 1),
     "1:1":    (1, 1),
+    "Manuell": "custom",
 }
 
 MODES = ["Ambilight", "🎮 Gaming", "🎬 Film", "Statisch", "Rainbow", "Breathing", "Color Cycle"]
@@ -73,6 +74,8 @@ DEFAULT_CONFIG = {
     "speed": 50,
     "mirror": False,
     "aspect": "Vollbild (Monitor)",
+    "crop_h": 0,
+    "crop_v": 0,
     "color": [255, 0, 80],
     "autostart_windows": False,
     "autostart_mode": False,   # Auto-Start beim Öffnen
@@ -243,6 +246,9 @@ class LedEngine:
         self.monitor_idx = 1
         self.actual_fps = 0.0
         self.current_leds = [(0,0,0)] * 36
+        self.preview_frame = None  # Small PIL Image for GUI
+        self.preview_enabled = False  # Toggle for CPU saving
+        self.last_thumb_time = 0
         self.connected = False
 
     def connect(self):
@@ -391,6 +397,18 @@ class LedEngine:
 
                 if frame is not None:
                     leds = self._sample_from_frame(frame, bri)
+                    # Throttled & Conditional thumbnail generation (~2 FPS)
+                    if self.preview_enabled:
+                        now = time.perf_counter()
+                        if now - self.last_thumb_time > 0.5:
+                            try:
+                                # Much more aggressive downsampling (stride 32) for "pixelated" look and CPU saving
+                                thumb = frame[::32, ::32]
+                                self.preview_frame = Image.fromarray(thumb)
+                                self.last_thumb_time = now
+                            except: pass
+                    else:
+                        self.preview_frame = None
                 else:
                     leds = cur
             elif mode == "Statisch":
@@ -443,15 +461,35 @@ class AmbilightGUI:
         self.root.title("Mauros DX-Light Ambilight Control")
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
+        
+        # Monitor Dimensionen holen
         with mss.mss() as sct:
             mon = sct.monitors[1]
             self.mon_w, self.mon_h = mon["width"], mon["height"]
+
+        # GUI Variablen initialisieren
+        self.mode_var = tk.StringVar(value="Ambilight")
+        self.bri_var = tk.IntVar(value=80)
+        self.smooth_var = tk.IntVar(value=25)
+        self.fps_var = tk.IntVar(value=90)
+        self.edge_var = tk.IntVar(value=6)
+        self.speed_var = tk.IntVar(value=50)
+        self.mirror_var = tk.BooleanVar(value=False)
+        self.aspect_var = tk.StringVar(value="Vollbild (Monitor)")
+        self.crop_l_var = tk.IntVar(value=0)
+        self.crop_r_var = tk.IntVar(value=0)
+        self.crop_t_var = tk.IntVar(value=0)
+        self.crop_b_var = tk.IntVar(value=0)
+        self.preview_show_var = tk.BooleanVar(value=True)
+        self.autostart_win_var = tk.BooleanVar(value=False)
+        self.autostart_mode_var = tk.BooleanVar(value=False)
+
         self._build_ui()
         self._apply_config()
         self._update_loop()
         self.tray_icon = None
+        self._tk_preview_img = None  # Keep reference
 
-        # Auto-Start beim Öffnen
         if self.cfg.get("autostart_mode", False):
             self.root.after(500, self._auto_start)
 
@@ -471,6 +509,23 @@ class AmbilightGUI:
         self.speed_var.set(cfg.get("speed", 50))
         self.mirror_var.set(cfg.get("mirror", False))
         self.aspect_var.set(cfg.get("aspect", "Vollbild (Monitor)"))
+
+        # Migration logic or load new values
+        if "crop_h" in cfg:
+            h = cfg["crop_h"]
+            self.crop_l_var.set(h); self.crop_r_var.set(h)
+        else:
+            self.crop_l_var.set(cfg.get("crop_l", 0))
+            self.crop_r_var.set(cfg.get("crop_r", 0))
+
+        if "crop_v" in cfg:
+            v = cfg["crop_v"]
+            self.crop_t_var.set(v); self.crop_b_var.set(v)
+        else:
+            self.crop_t_var.set(cfg.get("crop_t", 0))
+            self.crop_b_var.set(cfg.get("crop_b", 0))
+        
+        self.preview_show_var.set(cfg.get("preview_show", True))
         self.autostart_win_var.set(cfg.get("autostart_windows", False))
         self.autostart_mode_var.set(cfg.get("autostart_mode", False))
         col = cfg.get("color", [255, 0, 80])
@@ -493,6 +548,11 @@ class AmbilightGUI:
             "speed": self.speed_var.get(),
             "mirror": self.mirror_var.get(),
             "aspect": self.aspect_var.get(),
+            "crop_l": self.crop_l_var.get(),
+            "crop_r": self.crop_r_var.get(),
+            "crop_t": self.crop_t_var.get(),
+            "crop_b": self.crop_b_var.get(),
+            "preview_show": self.preview_show_var.get(),
             "color": [r, g, b],
             "autostart_windows": self.autostart_win_var.get(),
             "autostart_mode": self.autostart_mode_var.get(),
@@ -583,7 +643,6 @@ class AmbilightGUI:
                      "Breathing = Pulsierender Effekt\n"
                      "Color Cycle = Langsamer Farbwechsel")
 
-        self.mode_var = tk.StringVar(value="Ambilight")
         mode_combo = ttk.Combobox(mode_row, textvariable=self.mode_var,
                                    values=MODES, state="readonly", width=17)
         mode_combo.pack(side="left", padx=8)
@@ -600,7 +659,6 @@ class AmbilightGUI:
                                          font=("Segoe UI", 8))
         self.color_hex_label.pack(side="left")
 
-        self.speed_var = tk.IntVar(value=50)
         self._slider(card_mode, "Speed", self.speed_var, 5, 100, "%",
                      "Geschwindigkeit der Animation.\n"
                      "Betrifft Rainbow, Breathing, Color Cycle.")
@@ -611,7 +669,7 @@ class AmbilightGUI:
         fmt_row.pack(fill="x")
         tk.Label(fmt_row, text="Seitenverhältnis", bg=BG_CARD, fg=FG,
                  font=("Segoe UI", 9)).pack(side="left")
-        self.aspect_var = tk.StringVar(value="Vollbild (Monitor)")
+
         combo = ttk.Combobox(fmt_row, textvariable=self.aspect_var,
                              values=list(ASPECT_RATIOS.keys()),
                              state="readonly", width=20)
@@ -619,54 +677,62 @@ class AmbilightGUI:
         combo.bind("<<ComboboxSelected>>", self._on_aspect_change)
         Tooltip(combo, "Seitenverhältnis des Videos.\n"
                        "Schneidet schwarze Balken automatisch ab.")
-        self.crop_label = tk.Label(fmt_row, text="", bg=BG_CARD, fg=FG_DIM,
-                                   font=("Segoe UI", 8))
-        self.crop_label.pack(side="left", padx=4)
+
+        self.manual_crop_frame = tk.Frame(self.ambi_card, bg=BG_CARD)
+        self._slider(self.manual_crop_frame, "L-Crop", self.crop_l_var, 0, 50, "%", "Manueller linker Ausschnitt")
+        self._slider(self.manual_crop_frame, "R-Crop", self.crop_r_var, 0, 50, "%", "Manueller rechter Ausschnitt")
+        self._slider(self.manual_crop_frame, "O-Crop", self.crop_t_var, 0, 50, "%", "Manueller oberer Ausschnitt")
+        self._slider(self.manual_crop_frame, "U-Crop", self.crop_b_var, 0, 50, "%", "Manueller unterer Ausschnitt")
+        
+        pv_row = tk.Frame(self.manual_crop_frame, bg=BG_CARD)
+        pv_row.pack(fill="x", pady=(4,0))
+        pv_cb = ttk.Checkbutton(pv_row, text="Vorschau live (CPU-Last)",
+                                variable=self.preview_show_var, command=self._on_aspect_change)
+        pv_cb.pack(side="left")
+        Tooltip(pv_cb, "Deaktiviere dies, um CPU zu sparen,\nsobald der Bereich fertig eingestellt ist.")
+
+        self.crop_label = tk.Label(self.ambi_card, text="→ Gesamter Bildschirm",
+                                   bg=BG_CARD, fg=FG_DIM, font=("Segoe UI", 8))
+        self.crop_label.pack(anchor="w", pady=(2,0))
+        
         tk.Label(self.ambi_card, text=f"Monitor: {self.mon_w} × {self.mon_h}",
                  bg=BG_CARD, fg=FG_DIM, font=("Segoe UI", 8)).pack(anchor="w", pady=(2,0))
 
         # ---- Einstellungen Card ----
         card_settings = self._card(main, "Einstellungen", "🎛️")
-        self.mirror_var = tk.BooleanVar(value=False)
         mirror_cb = ttk.Checkbutton(card_settings, text="Links ↔ Rechts tauschen",
                                      variable=self.mirror_var)
         mirror_cb.pack(anchor="w", pady=(0,2))
         Tooltip(mirror_cb, "Spiegelt die LED-Zuordnung wenn der\n"
                            "Strip andersrum montiert ist.")
 
-        self.bri_var = tk.IntVar(value=80)
         self._slider(card_settings, "Helligkeit", self.bri_var, 0, 100, "%",
                      "Gesamthelligkeit der LEDs (0-100%).")
-        self.smooth_var = tk.IntVar(value=25)
         self._slider(card_settings, "Smoothing", self.smooth_var, 0, 90, "%",
                      "Glättung der Farbübergänge.\n0% = sofort, 50% = sanft, 90% = langsam.")
-        self.fps_var = tk.IntVar(value=90)
         self._slider(card_settings, "Ziel-FPS", self.fps_var, 15, 144, "",
                      "LED-Updates pro Sekunde.\n60 = Filme, 90-144 = Gaming.")
-        self.edge_var = tk.IntVar(value=6)
         self._slider(card_settings, "Randtiefe", self.edge_var, 2, 20, "%",
                      "Wie tief am Bildschirmrand gemessen wird.\nNur relevant im Ambilight-Modus.")
 
         # ---- System Card ----
         card_sys = self._card(main, "System", "⚙️")
 
-        self.autostart_mode_var = tk.BooleanVar(value=False)
         auto_mode_cb = ttk.Checkbutton(card_sys, text="Beim Öffnen automatisch starten",
                                         variable=self.autostart_mode_var)
-        auto_mode_cb.pack(anchor="w")
-        Tooltip(auto_mode_cb, "Startet den ausgewählten Modus\n"
-                               "automatisch wenn das Programm öffnet.\n"
-                               "Alle Einstellungen werden gespeichert.")
+        auto_mode_cb.pack(anchor="w", pady=(0,2))
+        Tooltip(auto_mode_cb, "Startet das Ambilight automatisch,\nsobald die App geöffnet wird.")
 
-        self.autostart_win_var = tk.BooleanVar(value=False)
-        auto_win_cb = ttk.Checkbutton(card_sys, text="Mit Windows starten",
-                                       variable=self.autostart_win_var,
-                                       command=self._toggle_autostart)
-        auto_win_cb.pack(anchor="w")
-        Tooltip(auto_win_cb, "Startet das Programm automatisch\n"
-                              "beim Windows-Login.\n"
-                              "Kombiniere mit 'Beim Öffnen starten'\n"
-                              "für volles Auto-Ambilight.")
+        auto_win_cb = ttk.Checkbutton(card_sys, text="Mit Windows starten (Autostart)",
+                                       variable=self.autostart_win_var, command=self._toggle_autostart)
+        auto_win_cb.pack(anchor="w", pady=(0,2))
+        Tooltip(auto_win_cb, "Fügt die App zum Windows-Autostart hinzu.")
+
+        # ---- Start Button ----
+        self.start_btn = tk.Button(main, text="▶  S T A R T", bg=ACCENT2, fg="#fff",
+                                   font=("Segoe UI", 12, "bold"), relief="flat",
+                                   padx=20, pady=10, cursor="hand2", command=self._toggle)
+        self.start_btn.pack(fill="x", pady=10)
 
         # ---- LED Vorschau ----
         tk.Label(main, text="LED Vorschau", bg=BG, fg=FG_DIM,
@@ -674,17 +740,8 @@ class AmbilightGUI:
         self.canvas = tk.Canvas(main, bg="#010409", height=55,
                                 highlightthickness=1, highlightbackground=BORDER)
         self.canvas.pack(fill="x", pady=(2,6))
-
-        # ---- Start Button ----
-        self.start_btn = tk.Button(
-            main, text="▶  S T A R T", command=self._toggle,
-            bg=ACCENT2, fg="#ffffff", activebackground="#2ea043",
-            activeforeground="#ffffff", font=("Segoe UI", 12, "bold"),
-            bd=0, padx=20, pady=6, cursor="hand2", relief="flat"
-        )
-        self.start_btn.pack(fill="x", ipady=3)
-        Tooltip(self.start_btn, "Startet oder stoppt die LEDs.\n"
-                                 "Einstellungen werden beim Schließen gespeichert.")
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<Button-1>", self._on_canvas_click)
 
     # ---- Callbacks ----
 
@@ -723,20 +780,60 @@ class AmbilightGUI:
 
     def _on_aspect_change(self, event=None):
         name = self.aspect_var.get()
-        aspect = ASPECT_RATIOS.get(name)
-        crop = calc_region(self.mon_w, self.mon_h, aspect)
-        self.engine.crop = crop
-        if aspect is None:
-            self.crop_label.configure(text="→ Gesamter Bildschirm")
+        if name == "Manuell":
+            self.manual_crop_frame.pack(fill="x", pady=(2,0))
+            crop = (self.crop_l_var.get()/100.0, self.crop_t_var.get()/100.0,
+                    self.crop_r_var.get()/100.0, self.crop_b_var.get()/100.0)
+            self.crop_label.configure(text="→ Manuelle Einstellung / Maus")
+            self.engine.preview_enabled = self.preview_show_var.get()
         else:
-            lr_px = int(self.mon_w * crop[0])
-            tb_px = int(self.mon_h * crop[1])
-            if lr_px > 0:
-                self.crop_label.configure(text=f"→ je {lr_px}px links/rechts")
-            elif tb_px > 0:
-                self.crop_label.configure(text=f"→ je {tb_px}px oben/unten")
+            self.manual_crop_frame.pack_forget()
+            self.engine.preview_enabled = False
+            aspect = ASPECT_RATIOS.get(name)
+            crop = calc_region(self.mon_w, self.mon_h, aspect)
+            if aspect is None:
+                self.crop_label.configure(text="→ Gesamter Bildschirm")
             else:
-                self.crop_label.configure(text="→ passt bereits")
+                lr_px = int(self.mon_w * crop[0])
+                tb_px = int(self.mon_h * crop[1])
+                if lr_px > 0:
+                    self.crop_label.configure(text=f"→ je {lr_px}px links/rechts")
+                elif tb_px > 0:
+                    self.crop_label.configure(text=f"→ je {tb_px}px oben/unten")
+                else:
+                    self.crop_label.configure(text="→ passt bereits")
+        self.engine.crop = crop
+
+    def _on_canvas_click(self, event):
+        if self.aspect_var.get() != "Manuell": return
+        self._drag_data = {"x": event.x, "y": event.y, 
+                          "l": self.crop_l_var.get(), "r": self.crop_r_var.get(),
+                          "t": self.crop_t_var.get(), "b": self.crop_b_var.get()}
+
+    def _on_canvas_drag(self, event):
+        if self.aspect_var.get() != "Manuell": return
+        w = self.canvas.winfo_width() or 400
+        h = self.canvas.winfo_height() or 55
+        pad, lw = 3, 12
+        tw = w - 2*pad - 2*lw - 4
+        th_inner = h - 2*pad - lw - 2 - (pad+lw+2) # from _draw_preview logic
+        
+        dx = (event.x - self._drag_data["x"]) / max(1, tw) * 100
+        dy = (event.y - self._drag_data["y"]) / max(1, th_inner) * 100
+        
+        # Scale movement: shifting the box
+        # Moving left (dx negative): less R-crop, more L-crop? No, L is from left edge.
+        # Shift: L increases by dx, R decreases by dx
+        nl = max(0, min(50, self._drag_data["l"] + dx))
+        nr = max(0, min(50, self._drag_data["r"] - dx))
+        nt = max(0, min(50, self._drag_data["t"] + dy))
+        nb = max(0, min(50, self._drag_data["b"] - dy))
+        
+        self.crop_l_var.set(int(nl))
+        self.crop_r_var.set(int(nr))
+        self.crop_t_var.set(int(nt))
+        self.crop_b_var.set(int(nb))
+        self._on_aspect_change()
 
     def _toggle(self):
         if self.engine.running:
@@ -764,7 +861,12 @@ class AmbilightGUI:
         self.engine.mode = self.mode_var.get()
         self.engine.effect_speed = self.speed_var.get()
 
-        for var in (self.bri_var, self.smooth_var, self.fps_var, self.edge_var, self.speed_var):
+        if self.aspect_var.get() == "Manuell":
+            self.engine.crop = (self.crop_l_var.get()/100.0, self.crop_t_var.get()/100.0,
+                                self.crop_r_var.get()/100.0, self.crop_b_var.get()/100.0)
+
+        for var in (self.bri_var, self.smooth_var, self.fps_var, self.edge_var, self.speed_var, 
+                    self.crop_l_var, self.crop_r_var, self.crop_t_var, self.crop_b_var):
             if hasattr(var, '_label'):
                 var._label.configure(text=f"{var.get()}{var._suffix}")
 
@@ -786,29 +888,57 @@ class AmbilightGUI:
         c.delete("all")
         w = c.winfo_width() or 400
         h = c.winfo_height() or 55
-        leds = self.engine.current_leds
+        
         pad, lw = 3, 12
-        for i in range(N):
-            y0 = pad + int((h-2*pad)*i/N)
-            y1 = pad + int((h-2*pad)*(i+1)/N) - 1
-            r, g, b = leds[11-i]
-            c.create_rectangle(pad, y0, pad+lw, y1,
-                               fill=f"#{r:02x}{g:02x}{b:02x}", outline="")
         tx0, tx1 = pad+lw+2, w-pad-lw-2
-        tw = tx1-tx0
+        ty0, ty1 = pad+lw+2, h-pad-2
+        tw = tx1 - tx0
+        th_inner = ty1 - ty0
+
+        # Hintergrund: Live-Bild vom Monitor im Inhaltsbereich
+        if self.engine.preview_frame:
+            try:
+                # Resize thumbnail for the inner content area
+                img = self.engine.preview_frame.resize((tw, th_inner), Image.NEAREST)
+                self._tk_preview_img = ImageTk.PhotoImage(img)
+                c.create_image(tx0, ty0, image=self._tk_preview_img, anchor="nw")
+            except: pass
+        
+        leds = self.engine.current_leds
+        # LEDs zeichnen (drüber)
         for i in range(N):
-            x0 = tx0 + int(tw*i/N)
-            x1 = tx0 + int(tw*(i+1)/N) - 1
-            r, g, b = leds[12+i]
-            c.create_rectangle(x0, pad, x1, pad+lw,
+            y0_led = pad + int((h-2*pad)*i/N)
+            y1_led = pad + int((h-2*pad)*(i+1)/N) - 1
+            r, g, b = leds[11-i]
+            c.create_rectangle(pad, y0_led, pad+lw, y1_led,
                                fill=f"#{r:02x}{g:02x}{b:02x}", outline="")
+            
+        for i in range(N):
+            x0_led = tx0 + int(tw*i/N)
+            x1_led = tx0 + int(tw*(i+1)/N) - 1
+            r, g, b = leds[12+i]
+            c.create_rectangle(x0_led, pad, x1_led, pad+lw,
+                               fill=f"#{r:02x}{g:02x}{b:02x}", outline="")
+            
         rx = w-pad-lw
         for i in range(N):
-            y0 = pad + int((h-2*pad)*i/N)
-            y1 = pad + int((h-2*pad)*(i+1)/N) - 1
+            y0_led = pad + int((h-2*pad)*i/N)
+            y1_led = pad + int((h-2*pad)*(i+1)/N) - 1
             r, g, b = leds[24+i]
-            c.create_rectangle(rx, y0, rx+lw, y1,
+            c.create_rectangle(rx, y0_led, rx+lw, y1_led,
                                fill=f"#{r:02x}{g:02x}{b:02x}", outline="")
+                               
+        # Visueller Crop-Rahmen
+        cl, ct, cr, cb = self.engine.crop
+        if cl > 0 or ct > 0 or cr > 0 or cb > 0:
+            cx0 = tx0 + int(tw * cl)
+            cy0 = ty0 + int(th_inner * ct)
+            cx1 = tx1 - int(tw * cr)
+            cy1 = ty1 - int(th_inner * cb)
+            # Brighter color for visibility on background
+            c_color = "#00f0ff"
+            c.create_rectangle(cx0, cy0, cx1, cy1, outline=c_color, dash=(2,2), width=1)
+            c.create_text((tx0+tx1)//2, (ty0+ty1)//2, text="CAPTURE AREA", fill=c_color, font=("Segoe UI", 7, "bold"))
 
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
