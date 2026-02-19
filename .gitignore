@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.spec
+dxlight_config.json
+.vscode/
+.idea/
+*.lnk
+*.bat
