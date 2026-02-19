@@ -36,8 +36,8 @@ MODES = ["Ambilight", "🎮 Gaming", "🎬 Film", "Statisch", "Rainbow", "Breath
 
 # Presets: (smoothing%, fps, edge%)
 MODE_PRESETS = {
-    "🎮 Gaming": (10, 144, 4),   # Reaktiv, schnell, schmaler Rand
-    "🎬 Film":   (50, 60, 10),   # Sanft, cinematisch, breiter Rand
+    "🎮 Gaming": (5, 120, 4),    # Extrem reaktiv, max 120 FPS, schmaler Rand
+    "🎬 Film":   (60, 60, 10),   # Sehr sanft, cinematisch, breiter Rand
 }
 
 # === Theme ===
@@ -307,73 +307,52 @@ class LedEngine:
         return [(int(r*255*bri), int(g*255*bri), int(b*255*bri))] * 36
 
     def _sample_from_frame(self, frame, bri):
-        """Vectorized: downsample → edge-slice → reshape+mean in 3 numpy ops."""
+        """Ultra-fast sampling: optimized slicing + vectorized means."""
         h, w = frame.shape[:2]
         cl, ct, cr_, cb = self.crop
-        x0 = int(w * cl)
-        y0 = int(h * ct)
-        x1 = max(x0+1, int(w * (1.0 - cr_)))
-        y1 = max(y0+1, int(h * (1.0 - cb)))
+        x0, y0 = int(w * cl), int(h * ct)
+        x1, y1 = max(x0+1, int(w * (1.0 - cr_))), max(y0+1, int(h * (1.0 - cb)))
 
-        # Downsample auf ~360p für schnellere Verarbeitung - keine float-Konvertierung mehr
-        scale = max(1, min(x1-x0, y1-y0) // 360)
+        # Downsample auf ~360p für Geschwindigkeit
+        scale = max(1, (y1 - y0) // 360)
         region = frame[y0:y1:scale, x0:x1:scale]
-        # Nur einmal am Ende konvertieren oder direkt mit uint8 rechnen
         rh, rw = region.shape[:2]
-        edge = max(1, int(min(rw, rh) * self.edge_pct))
+        edge = max(2, int(min(rw, rh) * self.edge_pct))
+        
+        leds = [(0,0,0)] * 36
 
-        leds = [None] * 36
+        def get_zone_colors(img, n, axis):
+            # axis 0 = vertikal teilen (Links/Rechts), axis 1 = horizontal teilen (Oben)
+            if img.size == 0: return [(0,0,0)] * n
+            chunk = img.shape[axis] // n
+            if chunk < 1:
+                m = img.mean(axis=(0, 1))
+                return [(int(m[0]*bri), int(m[1]*bri), int(m[2]*bri))] * n
+            
+            # Vectorized float calculation for precise means
+            img_float = img.astype(np.float32)
+            if axis == 0:
+                # Vertikal: (n, chunk, W, 3) -> mean über (1, 2)
+                res = img_float[:n*chunk].reshape(n, chunk, img.shape[1], 3).mean(axis=(1, 2))
+            else:
+                # Horizontal: (H, n, chunk, 3) -> mean über (0, 2)
+                res = img_float[:, :n*chunk].reshape(img.shape[0], n, chunk, 3).mean(axis=(0, 2))
+            
+            return [(min(255, int(m[0]*bri)), 
+                     min(255, int(m[1]*bri)), 
+                     min(255, int(m[2]*bri))) for m in res]
 
-        # Links (unten→oben) — vectorized
-        left = region[:, :edge]
-        lh = left.shape[0]
-        zone_h = lh // N
-        if zone_h > 0:
-            # Reshape zu (N, zone_h, edge, 3) → mean über (1,2)
-            # Erst hier in float wandeln für präzisen Mean
-            means = left[:zone_h*N].reshape(N, zone_h, edge, 3).mean(axis=(1,2))
-            for i in range(N):
-                idx = N - 1 - i  # unten→oben
-                leds[i] = (min(255,int(means[idx,0]*bri)),
-                           min(255,int(means[idx,1]*bri)),
-                           min(255,int(means[idx,2]*bri)))
-        else:
-            a = left.mean(axis=(0,1))
-            c = (min(255,int(a[0]*bri)), min(255,int(a[1]*bri)), min(255,int(a[2]*bri)))
-            for i in range(N): leds[i] = c
+        # 1. Links (unten -> oben)
+        l_strip = region[:, :edge]
+        leds[0:12] = get_zone_colors(l_strip, 12, axis=0)[::-1]
+        
+        # 2. Oben (links -> rechts)
+        t_strip = region[:edge, :]
+        leds[12:24] = get_zone_colors(t_strip, 12, axis=1)
 
-        # Oben (links→rechts) — vectorized
-        top = region[:edge, :]
-        tw = top.shape[1]
-        zone_w = tw // N
-        if zone_w > 0:
-            # Transpose um Spalten-Zonen zu machen: (W', edge, 3) → reshape
-            # Erst hier in float wandeln für präzisen Mean
-            means = top[:, :zone_w*N].transpose(1,0,2).reshape(N, zone_w, edge, 3).mean(axis=(1,2))
-            for i in range(N):
-                leds[12+i] = (min(255,int(means[i,0]*bri)),
-                              min(255,int(means[i,1]*bri)),
-                              min(255,int(means[i,2]*bri)))
-        else:
-            a = top.mean(axis=(0,1))
-            c = (min(255,int(a[0]*bri)), min(255,int(a[1]*bri)), min(255,int(a[2]*bri)))
-            for i in range(N): leds[12+i] = c
-
-        # Rechts (oben→unten) — vectorized
-        right = region[:, max(0,rw-edge):]
-        rh2 = right.shape[0]
-        zone_h2 = rh2 // N
-        if zone_h2 > 0:
-            # Erst hier in float wandeln für präzisen Mean
-            means = right[:zone_h2*N].reshape(N, zone_h2, right.shape[1], 3).mean(axis=(1,2))
-            for i in range(N):
-                leds[24+i] = (min(255,int(means[i,0]*bri)),
-                              min(255,int(means[i,1]*bri)),
-                              min(255,int(means[i,2]*bri)))
-        else:
-            a = right.mean(axis=(0,1))
-            c = (min(255,int(a[0]*bri)), min(255,int(a[1]*bri)), min(255,int(a[2]*bri)))
-            for i in range(N): leds[24+i] = c
+        # 3. Rechts (oben -> unten)
+        r_strip = region[:, max(0, rw-edge):]
+        leds[24:36] = get_zone_colors(r_strip, 12, axis=0)
 
         return leds
 
@@ -394,13 +373,21 @@ class LedEngine:
 
             if mode in ("Ambilight", "🎮 Gaming", "🎬 Film"):
                 frame = None
-                if sct is None: sct = mss.mss()
-                try:
-                    mon = sct.monitors[self.monitor_idx]
-                    raw = sct.grab(mon)
-                    frame = np.array(raw)[:,:,:3]
-                    frame = frame[:,:,::-1]  # BGR→RGB
-                except: frame = None
+                if sct is None:
+                    try:
+                        sct = mss.mss()
+                    except Exception as e:
+                        print(f"MSS Error: {e}")
+                
+                if sct:
+                    try:
+                        mon = sct.monitors[self.monitor_idx]
+                        raw = sct.grab(mon)
+                        # Hyper-fast zero-copy conversion: BGRA -> RGB (via view slicing 2::-1)
+                        # .raw ist schneller als .bgra in vielen Python-Versionen für Buffer
+                        frame = np.frombuffer(raw.raw, dtype=np.uint8).reshape(raw.height, raw.width, 4)[:,:,2::-1]
+                    except:
+                        frame = None
 
                 if frame is not None:
                     leds = self._sample_from_frame(frame, bri)
@@ -431,9 +418,12 @@ class LedEngine:
             elapsed = time.perf_counter() - t0
             fps_t.append(elapsed)
             if len(fps_t) > 30: fps_t.pop(0)
-            self.actual_fps = 1.0 / max(0.001, sum(fps_t)/len(fps_t))
+            avg_t = sum(fps_t)/len(fps_t)
+            self.actual_fps = 1.0 / max(0.001, avg_t)
+            
             wait = ft - elapsed
-            if wait > 0: time.sleep(wait)
+            if wait > 0:
+                time.sleep(wait)
 
         # Cleanup
         if sct:
