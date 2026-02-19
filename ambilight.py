@@ -203,6 +203,9 @@ def build_and_send(out, leds, cnt, mirror=False):
     for i in range(3):
         out.set_raw_data([0x00] + list(buf[i*64:(i+1)*64]))
         out.send()
+        # Small delay to prevent the device buffer from overflowing
+        # (Fixes the issue where the first packet/left side gets dropped)
+        time.sleep(0.002)
 
 
 def calc_region(mon_w, mon_h, aspect):
@@ -262,8 +265,8 @@ class LedEngine:
 
     def disconnect(self):
         if self.device:
+            self.stop() # Ensure LEDs are off and thread stopped
             try:
-                build_and_send(self.out, [(0,0,0)]*36, self.cnt)
                 self.device.close()
             except: pass
             self.device = None; self.out = None; self.connected = False
@@ -279,7 +282,14 @@ class LedEngine:
         self.running = False
         if self.thread: self.thread.join(timeout=2); self.thread = None
         if self.connected:
-            try: build_and_send(self.out, [(0,0,0)]*36, self.cnt)
+            try:
+                # Send "OFF" command multiple times with incrementing counter
+                # to ensure the hardware definitely receives and processes it.
+                black = [(0,0,0)]*36
+                for _ in range(3):
+                    build_and_send(self.out, black, self.cnt)
+                    self.cnt = (self.cnt + 1) & 0xFF
+                    time.sleep(0.01)
             except: pass
 
     def _gen_static(self):
